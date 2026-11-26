@@ -18,7 +18,7 @@ class ReportGenService(BaseModuleService):
     OPERATION_TERM = "校验"
     LIST_FIELDS = ["报告编码", "实验编码", "报告模板", "数据窗口", "生成状态"]
     REQUIRED_FIELDS = ["报告编码", "实验编码", "报告模板"]
-    STATUS_ORDER = ["排队中", "生成中", "已完成", "生成失败"]
+    STATUS_ORDER = ["排队中", "生成中", "已完成", "生成失败", "已办结"]
     ACTION_RULES = {"开始生成": "生成中", "重试生成": "生成失败"}
     NEGATIVE_ACTIONS = []
 
@@ -150,3 +150,132 @@ class ReportGenService(BaseModuleService):
             "abnormal": False,
         })
         return {"ok": True, "message": "报告结论已写入归档库"}
+
+    def investigate_historical_missing(self, entry_id: int, context: dict[str, Any] | None = None) -> dict[str, Any]:
+        context = context or {}
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "http_status": 404, "message": "报告申请不存在"}
+        expected_token = context.get("claim_token")
+        if entry.get("claim_token") and expected_token and expected_token != entry.get("claim_token"):
+            return {"ok": False, "http_status": 409, "code": "CLAIM_CONFLICT", "message": "报告申请领取令牌已变更，请刷新后选择处置方向", "entry": entry}
+        now = datetime.now(timezone.utc).isoformat()
+        entry.update({
+            "status": "生成中",
+            "生成状态": "历史缺测影响调查中",
+            "办理状态": "调查历史缺测及其影响",
+            "办结类型": "历史缺测影响调查",
+            "办理结论": "本申请用于调查 W 窗口历史缺测及其实际影响",
+            "pending": True,
+        })
+        timeline = entry.setdefault("办理轨迹", [])
+        if isinstance(timeline, list):
+            timeline.append({"时间": now, "事件": "明确按历史缺测及其影响继续调查"})
+        entry["最近办理"] = "调查历史缺测及其影响"
+        return {"ok": True, "message": "报告申请已明确为历史缺测及其影响调查", "entry": entry}
+
+    def close_as_recovery(self, entry_id: int, context: dict[str, Any] | None = None) -> dict[str, Any]:
+        context = context or {}
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "http_status": 404, "message": "报告申请不存在"}
+        expected_token = context.get("claim_token")
+        if entry.get("claim_token") and expected_token and expected_token != entry.get("claim_token"):
+            return {"ok": False, "http_status": 409, "code": "CLAIM_CONFLICT", "message": "报告申请领取令牌已变更，请刷新后再按恢复办结", "entry": entry}
+        fresh_id = entry.get("时效记录ID")
+        if fresh_id not in (None, ""):
+            from app.services.data_freshness import DataFreshnessService
+
+            result = DataFreshnessService().confirm_recovery(int(fresh_id), context=context)
+            if not result.get("ok"):
+                return result
+            return {"ok": True, "message": "已通过时效记录按恢复办结", "entry": result.get("report") or entry, "freshness": result.get("entry")}
+        now = datetime.now(timezone.utc).isoformat()
+        entry.update({"status": "已办结", "生成状态": "恢复办结", "办理状态": "按恢复办结", "办结类型": "恢复办结", "pending": False, "办结时间": now})
+        return {"ok": True, "message": "报告申请已按恢复办结", "entry": entry}
+
+    def generate_missing_impact(self, entry_id: int) -> dict[str, Any]:
+        """把待确认缺测凭证计算成可审阅的实际缺测影响报告数据。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "http_status": 404, "message": "报告申请不存在"}
+        if entry.get("办结类型") == "恢复办结":
+            return {"ok": False, "code": "RECOVERY_CLOSED", "message": "该申请已按恢复办结，不再计算缺测影响"}
+        fresh_id = entry.get("时效记录ID") or entry.get("freshness_id")
+        fresh = store.find("data_freshness", int(fresh_id)) if str(fresh_id or "").isdigit() else None
+        cert = entry.get("告警凭证") or entry.get("缺测凭证") or (fresh or {}).get("告警凭证")
+        anomaly = next((a for a in store.rows("anomaly_metric") if a.get("告警凭证") == cert), None)
+        metric = entry.get("指标编码") or (fresh or {}).get("指标编码", "")
+        window = entry.get("计算窗口") or entry.get("数据窗口") or (fresh or {}).get("计算窗口", "")
+        related_jobs = [
+            j for j in store.rows("metric_compute")
+            if j.get("指标编码") == metric and str(j.get("计算窗口") or "") == str(window)
+        ]
+        now = datetime.now(timezone.utc).isoformat()
+        impact_data = {
+            "report_type": "missing_observation_impact",
+            "metric_code": metric,
+            "window": window,
+            "freshness_id": fresh.get("id") if fresh else fresh_id,
+            "certificate": cert,
+            "anomaly_id": anomaly.get("id") if anomaly else None,
+            "missing_reason": (fresh or {}).get("缺数原因") or entry.get("申请原因", ""),
+            "delay_minutes": (fresh or {}).get("延迟分钟", ""),
+            "related_job_count": len(related_jobs),
+            "job_batches": [j.get("作业批次") or j.get("id") for j in related_jobs],
+            "generated_at": now,
+        }
+        entry.update({
+            "status": "已完成",
+            "生成状态": "已完成",
+            "报告数据状态": "已计算",
+            "报告数据": impact_data,
+            "影响范围": f"指标 {metric} 的窗口 {window}；关联作业 {len(related_jobs)} 个",
+            "办理状态": "历史缺测影响已生成",
+            "办结类型": entry.get("办结类型") or "历史缺测影响调查",
+            "pending": False,
+            "abnormal": False,
+            "生成时间": now,
+        })
+        timeline = entry.setdefault("办理轨迹", [])
+        if isinstance(timeline, list):
+            timeline.append({"时间": now, "事件": "已根据真实缺测凭证计算历史缺测及影响数据"})
+        entry["最近办理"] = "缺测影响报告数据已生成"
+        return {"ok": True, "message": "缺测影响报告数据已生成，历史凭证和影响范围可审阅", "entry": entry, "report_data": impact_data}
+
+    def claim_application(self, entry_id: int, context: dict[str, Any] | None = None) -> dict[str, Any]:
+        context = context or {}
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "http_status": 404, "message": "报告申请不存在"}
+        version = int(entry.get("version") or 1) + 1
+        entry["version"] = version
+        entry["claim_token"] = f"CLAIM-RPT-{entry_id}-v{version}"
+        entry["领取人"] = context.get("owner") or context.get("值班员") or "值班员"
+        entry["领取时间"] = datetime.now(timezone.utc).isoformat()
+        return {"ok": True, "message": "已领取报告申请", "entry": entry, "claim_token": entry["claim_token"]}
+
+    def run_action(  # type: ignore[override]
+        self,
+        entry_id: int,
+        action: str,
+        context: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        result = self.dispatch_action(entry_id, action, context or {})
+        return result.get("entry"), str(result.get("message", ""))
+
+    def dispatch_action(self, entry_id: int, action: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
+        ctx = context or {}
+        if action in {"开始生成", "计算报告数据", "生成影响数据"}:
+            row = store.find(self.MODULE, entry_id)
+            text = f"{(row or {}).get('报告类型', '')}{(row or {}).get('报告模板', '')}"
+            if row is not None and ("缺测影响" in text or row.get("时效记录ID") or row.get("告警凭证")):
+                return self.generate_missing_impact(entry_id)
+            return super().dispatch_action(entry_id, action, ctx)
+        if action in {"调查历史缺测", "调查历史缺测及其影响", "继续影响调查", "investigate", "investigate_history"}:
+            return self.investigate_historical_missing(entry_id, ctx)
+        if action in {"恢复办结", "按恢复办结", "close_recovery", "recover"}:
+            return self.close_as_recovery(entry_id, ctx)
+        if action in {"领取", "领取申请", "领取报告", "claim"}:
+            return self.claim_application(entry_id, ctx)
+        return super().dispatch_action(entry_id, action, ctx)

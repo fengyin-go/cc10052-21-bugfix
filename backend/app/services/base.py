@@ -43,6 +43,18 @@ class BaseModuleService:
     def get_entry(self, entry_id: int) -> dict[str, Any] | None:
         return store.find(self.MODULE, entry_id)
 
+    def update_entry(self, entry_id: int, values: dict[str, Any]) -> dict[str, Any] | None:
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None
+        for key, value in (values or {}).items():
+            if key != "id":
+                entry[key] = value
+        requested_status = str(values.get("status") or "").strip()
+        if requested_status and requested_status in self.STATUS_ORDER:
+            entry["status"] = requested_status
+        return entry
+
     def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
         missing = [
             field for field in self.REQUIRED_FIELDS
@@ -52,10 +64,15 @@ class BaseModuleService:
             return None, missing
         rows = store.rows(self.MODULE)
         entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
+        # 保留调用方提交的扩展证据字段；列表字段仍会被显式归一化。
+        for key, value in values.items():
+            if key != "id":
+                entry[key] = value
         entry.update({field: values.get(field) for field in self.LIST_FIELDS})
-        entry["status"] = self.STATUS_ORDER[0]
-        entry["pending"] = True
-        entry["abnormal"] = False
+        requested_status = str(values.get("status") or "").strip()
+        entry["status"] = requested_status if requested_status in self.STATUS_ORDER else self.STATUS_ORDER[0]
+        entry["pending"] = values.get("pending", entry["status"] != self.STATUS_ORDER[-1])
+        entry["abnormal"] = bool(values.get("abnormal", False))
         rows.append(entry)
         return entry, []
 
@@ -70,6 +87,17 @@ class BaseModuleService:
         entry["pending"] = target != self.STATUS_ORDER[-1]
         entry["abnormal"] = action in self.NEGATIVE_ACTIONS
         return entry, f"{self.ENTITY}已{action}"
+
+    def dispatch_action(
+        self,
+        entry_id: int,
+        action: str,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """统一动作分派；复杂模块可覆盖本方法以消费请求中的证据和备注。"""
+        # 显式调用基类骨架，避免子类 run_action 与 dispatch_action 互相委托时递归。
+        entry, message = BaseModuleService.run_action(self, entry_id, action)
+        return {"ok": entry is not None, "message": message, "entry": entry}
 
     def domain_snapshot(self) -> dict[str, Any]:
         """输出模块级数据质量快照，供跨模块消费和题位源码锚点使用。"""

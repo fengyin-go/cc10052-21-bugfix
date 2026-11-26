@@ -82,17 +82,48 @@ def get_entry(module: str, entry_id: int) -> dict[str, Any]:
     return entry
 
 
+@router.patch("/{module}/{entry_id}", response_model=dict)
+def update_entry(module: str, entry_id: int, payload: EntryPayload) -> dict[str, Any]:
+    service = require_service(module)
+    values = dict(payload.model_extra or {})
+    values.update(payload.values or {})
+    entry = service.update_entry(entry_id, values)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"资源 {entry_id} 不存在或已归档")
+    return entry
+
+
+@router.put("/{module}/{entry_id}", response_model=dict)
+def replace_entry(module: str, entry_id: int, payload: EntryPayload) -> dict[str, Any]:
+    return update_entry(module, entry_id, payload)
+
+
 @router.post("/{module}", response_model=ActionResult)
 def create_entry(module: str, payload: EntryPayload) -> ActionResult:
     service = require_service(module)
-    entry, missing = service.create_entry(payload.values)
+    values = dict(payload.model_extra or {})
+    values.update(payload.values or {})
+    entry, missing = service.create_entry(values)
     if missing:
         return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
     return ActionResult(ok=True, message=f"{service.ENTITY}已登记", entry=entry)
 
 
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
-def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
+def run_action(
+    module: str,
+    entry_id: int,
+    payload: ActionPayload,
+) -> ActionResult:
     service = require_service(module)
-    entry, message = service.run_action(entry_id, payload.action.strip())
-    return ActionResult(ok=entry is not None, message=message, entry=entry)
+    context: dict[str, Any] = {}
+    context.update(payload.model_extra or {})
+    context.update(payload.values or {})
+    if payload.remark is not None:
+        context["remark"] = payload.remark
+    if payload.reason is not None:
+        context["reason"] = payload.reason
+    context = {key: value for key, value in context.items() if value is not None}
+    result = service.dispatch_action(entry_id, payload.action.strip(), context)
+    # 本项目动作接口约定始终以 HTTP 200 返回 ActionResult；业务成败看 ok/code/message。
+    return ActionResult.model_validate(result)

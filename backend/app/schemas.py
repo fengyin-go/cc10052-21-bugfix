@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 T = TypeVar("T")
 
@@ -16,16 +16,25 @@ class PageResult(BaseModel, Generic[T]):
 
 
 class ActionResult(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     ok: bool
     message: str
     entry: dict[str, Any] | None = None
+    http_status: int | None = Field(default=None, exclude=True)
 
 
 class EntryPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     values: dict[str, Any] = Field(default_factory=dict)
     remark: str | None = None
 
 
 class ActionPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     action: str
     remark: str | None = None
+    reason: str | None = None
+    values: dict[str, Any] = Field(default_factory=dict)
